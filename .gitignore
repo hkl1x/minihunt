@@ -29,3 +29,5 @@ mitmdump_child.log
 *.zip
 
 *.lnk
+local_capture.jsonl
+*.jsonl
