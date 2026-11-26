@@ -1,0 +1,650 @@
+"""
+DebugEngine - wraps debug_server, proxy_server, frida_server into a reusable class.
+"""
+import asyncio
+import json
+import random
+import platform
+import re
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+import frida
+import websockets
+import websockets.server
+import websockets.exceptions
+
+from .codex import wrap_debug_message_data, unwrap_debug_message_data
+from .third_party import wmpf_debug_pb2 as proto
+from .userscript import (
+    build_cdp_enable_page_command,
+    build_cdp_add_script_command,
+    build_injection_wrapper,
+)
+
+
+class DebugMessageBus:
+    """Central event bus bridging debug server and CDP proxy server."""
+
+    def __init__(self):
+        self._cdp_callbacks = []
+        self._proxy_callbacks = []
+
+    def on_cdp_message(self, callback):
+        self._cdp_callbacks.append(callback)
+
+    def on_proxy_message(self, callback):
+        self._proxy_callbacks.append(callback)
+
+    def reset(self):
+        """清空全部回调。
+
+        重启场景下 _start_debug_server()/_start_proxy_server() 会重新注册
+        回调；若不清空，回调数随重启次数累积（N 次 → N 个回调），
+        每条 CDP 命令被 emit N 次，运行时报 Duplicate 'id'。
+        """
+        self._cdp_callbacks.clear()
+        self._proxy_callbacks.clear()
+
+    def emit_cdp_message(self, message: str):
+        for cb in self._cdp_callbacks:
+            cb(message)
+
+    def emit_proxy_message(self, message: str):
+        for cb in self._proxy_callbacks:
+            cb(message)
+
+
+def buffer_to_hex_string(data: bytes) -> str:
+    return data.hex()
+
+
+def _build_protobuf_cdp_message(cdp_json: str, seq: int) -> bytes:
+    """Wrap a CDP JSON command into protobuf binary for sending to the miniapp runtime."""
+    raw_payload = {
+        "jscontext_id": "",
+        "op_id": round(100 * random.random()),
+        "payload": cdp_json,
+    }
+    wrapped = wrap_debug_message_data(raw_payload, "chromeDevtools", 0)
+    out_msg = proto.WARemoteDebug_DebugMessage()
+    out_msg.seq = seq
+    out_msg.category = "chromeDevtools"
+    out_msg.data = wrapped["buffer"]
+    out_msg.compressAlgo = 0
+    out_msg.originalSize = wrapped["originalSize"]
+    return out_msg.SerializeToString()
+
+
+class DebugEngine:
+    """Wraps all three subsystems: debug server, proxy server, frida injection."""
+
+    def __init__(self, options, logger, userscripts=None):
+        self.options = options
+        self.logger = logger
+        self.bus = DebugMessageBus()
+        self.userscripts = userscripts or []
+        self.debug_srv = None
+        self.proxy_srv = None
+        self.frida_session = None
+        self.frida_script = None
+        self.miniapp_clients = set()
+        self.miniapp_primary = None   # 最新连接：CDP 命令只发给它，避免多连接并存时同 id 重复投递
+        self.devtools_clients = set()
+        self.message_counter = 0
+        self._pending_responses = {}
+        self._cmd_counter = 80000
+        self._status_callbacks = []
+        self._event_listeners = {}   # method -> [callback, ...]
+        self.status = {"frida": False, "miniapp": False, "devtools": False,
+                       "wmpf_version": None, "offset_ready": None}
+
+    def on_status_change(self, callback):
+        self._status_callbacks.append(callback)
+
+    def _notify_status(self, key, value):
+        self.status[key] = value
+        for cb in self._status_callbacks:
+            try:
+                cb(dict(self.status))
+            except Exception:
+                pass
+
+    def _next_cmd_id(self):
+        self._cmd_counter += 1
+        return self._cmd_counter
+
+    async def start(self):
+        """Start all three subsystems."""
+        # 重启场景：frida 掉线后 debug/proxy server 可能仍在监听，
+        # 先关闭旧 server，避免重绑端口报 10048
+        if self.debug_srv:
+            try:
+                self.debug_srv.close()
+                await self.debug_srv.wait_closed()
+            except Exception:
+                pass
+            self.debug_srv = None
+        if self.proxy_srv:
+            try:
+                self.proxy_srv.close()
+                await self.proxy_srv.wait_closed()
+            except Exception:
+                pass
+            self.proxy_srv = None
+        # 防止回调累积导致的 Duplicate 'id'
+        self.bus.reset()
+        self.debug_srv = await self._start_debug_server()
+        self.proxy_srv = await self._start_proxy_server()
+        try:
+            # frida 全流程（enumerate_processes/attach/create_script/load）全是同步阻塞
+            # 调用，直接 await 会卡死整个事件循环数秒到几十秒——期间所有 HTTP/WS 请求
+            # （含 /agent/stop、前端状态轮询）全部排队无响应。必须丢线程池执行
+            self.frida_session, self.frida_script = await asyncio.to_thread(self._start_frida_sync)
+            self._notify_status("frida", True)
+        except Exception as e:
+            self.logger.error(str(e))
+            raise
+
+    async def stop(self):
+        """Graceful shutdown."""
+        if self.debug_srv:
+            self.debug_srv.close()
+            await self.debug_srv.wait_closed()
+            self.debug_srv = None
+        if self.proxy_srv:
+            self.proxy_srv.close()
+            await self.proxy_srv.wait_closed()
+            self.proxy_srv = None
+        if self.frida_script:
+            try:
+                self.frida_script.unload()
+            except Exception:
+                pass
+            self.frida_script = None
+        if self.frida_session:
+            try:
+                self.frida_session.detach()
+            except Exception:
+                pass
+            self.frida_session = None
+        self._notify_status("frida", False)
+        self._notify_status("miniapp", False)
+        self._notify_status("devtools", False)
+        # 停止后版本信息已过时，回「未注入」（版本只在注入过程中检测上报）
+        self._notify_status("wmpf_version", None)
+        self._notify_status("offset_ready", None)
+        self.miniapp_clients.clear()
+        self.miniapp_primary = None
+        self.devtools_clients.clear()
+        self.message_counter = 0
+        self._pending_responses.clear()
+        self.logger.info("[server] engine stopped")
+
+    async def _cdp_request(self, method, params, timeout):
+        """Send a CDP command and await its response.
+
+        Duplicate id 兜底：多连接并存瞬间同一 id 可能被投递两次，
+        运行时会对后到的报 -32600 Duplicate 'id'，此时换新 id 重发一次。
+        """
+        resp = None
+        for attempt in range(2):
+            cmd_id = self._next_cmd_id()
+            cdp_cmd = json.dumps({"id": cmd_id, "method": method, "params": params})
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+            self._pending_responses[cmd_id] = future
+            self.bus.emit_proxy_message(cdp_cmd)
+            try:
+                resp = await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                self._pending_responses.pop(cmd_id, None)
+                raise
+            err = resp.get("error") or {}
+            if attempt == 0 and err.get("code") == -32600 and "Duplicate" in str(err.get("message", "")):
+                continue
+            return resp
+        return resp
+
+    async def evaluate_js(self, expression, timeout=5.0):
+        """Send Runtime.evaluate via CDP to the miniapp, return result dict."""
+        if not self.miniapp_clients:
+            raise RuntimeError("No miniapp client connected")
+        return await self._cdp_request(
+            "Runtime.evaluate",
+            {"expression": expression, "returnByValue": True, "awaitPromise": True},
+            timeout,
+        )
+
+    async def send_cdp_command(self, method, params=None, timeout=5.0):
+        """Send an arbitrary CDP command and return the response."""
+        if not self.miniapp_clients:
+            raise RuntimeError("No miniapp client connected")
+        return await self._cdp_request(method, params or {}, timeout)
+
+    async def set_extra_headers(self, headers: dict):
+        """Enable Network domain and set extra HTTP headers via CDP."""
+        await self.send_cdp_command("Network.enable")
+        await self.send_cdp_command("Network.setExtraHTTPHeaders",
+                                    {"headers": headers})
+
+    def on_cdp_event(self, method, callback):
+        """Subscribe to a CDP event by method name (e.g. 'Debugger.scriptParsed')."""
+        self._event_listeners.setdefault(method, []).append(callback)
+
+    def off_cdp_event(self, method, callback):
+        """Unsubscribe from a CDP event."""
+        cbs = self._event_listeners.get(method, [])
+        if callback in cbs:
+            cbs.remove(callback)
+
+    def _handle_cdp_response(self, message_str):
+        """Check if a CDP response matches a pending evaluate_js call, or dispatch events."""
+        try:
+            data = json.loads(message_str)
+        except (json.JSONDecodeError, TypeError):
+            return
+        msg_id = data.get("id")
+        if msg_id is not None and msg_id in self._pending_responses:
+            future = self._pending_responses.pop(msg_id)
+            if not future.done():
+                future.set_result(data)
+        # Dispatch CDP events (messages with "method" but no "id")
+        method = data.get("method")
+        if method and method in self._event_listeners:
+            for cb in self._event_listeners[method]:
+                try:
+                    cb(data)
+                except Exception:
+                    pass
+
+    # ── Debug Server ──
+
+    async def _start_debug_server(self):
+        engine = self
+        logger = self.logger
+        bus = self.bus
+        userscripts = self.userscripts
+
+        scripts_injected = False
+
+        def on_proxy_message(message: str):
+            engine.message_counter += 1
+            raw_payload = {
+                "jscontext_id": "",
+                "op_id": round(100 * random.random()),
+                "payload": str(message),
+            }
+            logger.main_debug(raw_payload)
+            wrapped = wrap_debug_message_data(raw_payload, "chromeDevtools", 0)
+            out_msg = proto.WARemoteDebug_DebugMessage()
+            out_msg.seq = engine.message_counter
+            out_msg.category = "chromeDevtools"
+            out_msg.data = wrapped["buffer"]
+            out_msg.compressAlgo = 0
+            out_msg.originalSize = wrapped["originalSize"]
+            encoded = out_msg.SerializeToString()
+            # 命令只发最新一条连接：WeChatAppEx 重连时新旧连接会短暂并存，
+            # 广播会导致同一 CDP id 被投递两次，触发运行时 Duplicate 'id' 错误
+            primary = engine.miniapp_primary
+            if primary is not None and primary in engine.miniapp_clients:
+                targets = [primary]
+            else:
+                targets = list(engine.miniapp_clients)
+            for ws in targets:
+                try:
+                    task = asyncio.ensure_future(ws.send(encoded))
+                    task.add_done_callback(lambda t: t.exception() if t.done() and not t.cancelled() and t.exception() else None)
+                except Exception:
+                    pass
+
+        bus.on_proxy_message(on_proxy_message)
+
+        async def handler(websocket):
+            nonlocal scripts_injected
+            engine.miniapp_clients.add(websocket)
+            engine.miniapp_primary = websocket
+            engine._notify_status("miniapp", True)
+            logger.info("[miniapp] miniapp client connected")
+
+            if userscripts and not scripts_injected:
+                scripts_injected = True
+                logger.info("[userscript] registering scripts immediately on connection...")
+                try:
+                    seq = engine.message_counter
+                    cmd_id = 90000
+                    seq += 1
+                    await websocket.send(_build_protobuf_cdp_message(
+                        build_cdp_enable_page_command(cmd_id), seq
+                    ))
+                    cmd_id += 1
+                    seq += 1
+                    await websocket.send(_build_protobuf_cdp_message(
+                        json.dumps({"id": cmd_id, "method": "Debugger.enable", "params": {}}), seq
+                    ))
+                    cmd_id += 1
+                    logger.info("[anti-debug] Debugger.enable sent")
+                    seq += 1
+                    await websocket.send(_build_protobuf_cdp_message(
+                        json.dumps({"id": cmd_id, "method": "Debugger.setSkipAllPauses", "params": {"skip": True}}), seq
+                    ))
+                    cmd_id += 1
+                    logger.info("[anti-debug] Debugger.setSkipAllPauses(true) sent")
+                    for script in userscripts:
+                        seq += 1
+                        await websocket.send(_build_protobuf_cdp_message(
+                            build_cdp_add_script_command(script, cmd_id), seq
+                        ))
+                        cmd_id += 1
+                        logger.info(f"[userscript] registered (persistent): {script.name}")
+                    engine.message_counter = seq
+                    logger.info("[userscript] registration done, scripts will run on page load")
+                except Exception as e:
+                    logger.error(f"[userscript] registration error: {e}")
+
+            immediate_done = False
+            try:
+                async for message in websocket:
+                    if isinstance(message, str):
+                        message = message.encode("utf-8")
+                    msg_category = ""
+                    try:
+                        decoded_msg = proto.WARemoteDebug_DebugMessage()
+                        decoded_msg.ParseFromString(message)
+                        msg_category = decoded_msg.category
+                    except Exception:
+                        pass
+                    self._process_miniapp_message(message)
+                    if msg_category == "setupContext" and userscripts and not immediate_done:
+                        immediate_done = True
+                        await asyncio.sleep(0.5)
+                        try:
+                            seq = engine.message_counter
+                            cmd_id = 91000
+                            seq += 1
+                            await websocket.send(_build_protobuf_cdp_message(
+                                json.dumps({"id": cmd_id, "method": "Debugger.enable", "params": {}}), seq
+                            ))
+                            cmd_id += 1
+                            seq += 1
+                            await websocket.send(_build_protobuf_cdp_message(
+                                json.dumps({"id": cmd_id, "method": "Debugger.setSkipAllPauses", "params": {"skip": True}}), seq
+                            ))
+                            cmd_id += 1
+                            logger.info("[anti-debug] Debugger.setSkipAllPauses re-sent after setupContext")
+                            for script in userscripts:
+                                wrapped = build_injection_wrapper(script)
+                                seq += 1
+                                cdp_cmd = json.dumps({
+                                    "id": cmd_id,
+                                    "method": "Runtime.evaluate",
+                                    "params": {
+                                        "expression": wrapped,
+                                        "includeCommandLineAPI": True,
+                                        "silent": False,
+                                    },
+                                })
+                                await websocket.send(_build_protobuf_cdp_message(cdp_cmd, seq))
+                                cmd_id += 1
+                                logger.info(f"[userscript] immediate inject (Runtime.evaluate): {script.name}")
+                            engine.message_counter = seq
+                        except Exception as e:
+                            logger.error(f"[userscript] immediate inject failed: {e}")
+            except websockets.exceptions.ConnectionClosed:
+                pass
+            except Exception as e:
+                logger.error(f"[miniapp] miniapp client err: {e}")
+            finally:
+                engine.miniapp_clients.discard(websocket)
+                if engine.miniapp_primary is websocket:
+                    # 最新连接断开时把 primary 指向剩余连接中的一条，避免悬空引用
+                    engine.miniapp_primary = next(iter(engine.miniapp_clients), None)
+                if not engine.miniapp_clients:
+                    engine._notify_status("miniapp", False)
+                    # 清理所有挂起的 CDP 响应，防止 future 泄漏
+                    for fid, fut in list(engine._pending_responses.items()):
+                        if not fut.done():
+                            fut.set_exception(RuntimeError("miniapp disconnected"))
+                    engine._pending_responses.clear()
+                logger.info("[miniapp] miniapp client disconnected")
+
+        server = await websockets.server.serve(
+            handler, "0.0.0.0", self.options.debug_port,
+            max_size=None,
+        )
+        logger.info(f"[server] debug server running on ws://localhost:{self.options.debug_port}")
+        logger.info("[server] debug server waiting for miniapp to connect...")
+        return server
+
+    def _process_miniapp_message(self, message: bytes):
+        self.logger.main_debug(
+            f"[miniapp] client received raw message (hex): {buffer_to_hex_string(message)}"
+        )
+        unwrapped_data = None
+        try:
+            decoded = proto.WARemoteDebug_DebugMessage()
+            decoded.ParseFromString(message)
+            unwrapped_data = unwrap_debug_message_data(decoded)
+            self.logger.main_debug("[miniapp] [DEBUG] decoded data:")
+            self.logger.main_debug(unwrapped_data)
+        except Exception as e:
+            self.logger.error(f"[miniapp] miniapp client err: {e}")
+
+        if unwrapped_data is None:
+            return
+
+        if unwrapped_data.get("category") == "chromeDevtoolsResult":
+            payload = unwrapped_data["data"].get("payload", "")
+            self.bus.emit_cdp_message(payload)
+            # Also check for pending evaluate_js responses
+            self._handle_cdp_response(payload)
+
+    # ── Proxy Server ──
+
+    async def _start_proxy_server(self):
+        engine = self
+        logger = self.logger
+        bus = self.bus
+
+        def on_cdp_message(message: str):
+            clients_snapshot = list(engine.devtools_clients)
+            for ws in clients_snapshot:
+                try:
+                    task = asyncio.ensure_future(ws.send(message))
+                    task.add_done_callback(lambda t: t.exception() if t.done() and not t.cancelled() and t.exception() else None)
+                except Exception:
+                    pass
+
+        bus.on_cdp_message(on_cdp_message)
+
+        async def handler(websocket):
+            engine.devtools_clients.add(websocket)
+            engine._notify_status("devtools", True)
+            logger.info("[cdp] CDP client connected")
+            try:
+                async for message in websocket:
+                    if isinstance(message, bytes):
+                        message = message.decode("utf-8")
+                    bus.emit_proxy_message(message)
+            except websockets.exceptions.ConnectionClosed:
+                pass
+            except Exception as e:
+                logger.error(f"[cdp] CDP client err: {e}")
+            finally:
+                engine.devtools_clients.discard(websocket)
+                if not engine.devtools_clients:
+                    engine._notify_status("devtools", False)
+                logger.info("[cdp] CDP client disconnected")
+
+        server = await websockets.server.serve(
+            handler, "0.0.0.0", self.options.cdp_port,
+            max_size=None,
+        )
+        logger.info(f"[server] proxy server running on ws://localhost:{self.options.cdp_port}")
+        logger.info(f"[server] link: devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{self.options.cdp_port}")
+        return server
+
+    # ── Frida ──
+
+    # ── Frida: platform helpers ──
+
+    def _get_project_root(self):
+        if getattr(sys, 'frozen', False):
+            return Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent)).resolve()
+        return Path(__file__).parent.parent.resolve()
+
+    def _find_wmpf_pids_win(self):
+        """Windows: find main WeChatAppEx.exe PID via ppid frequency."""
+        device = frida.get_local_device()
+        processes = device.enumerate_processes(scope="metadata")
+        wmpf_procs = [p for p in processes if p.name == "WeChatAppEx.exe"]
+        if not wmpf_procs:
+            raise RuntimeError("[frida] WeChatAppEx.exe process not found")
+
+        ppids = [p.parameters.get("ppid", 0) or 0 for p in wmpf_procs]
+        main_pid = Counter(ppids).most_common(1)[0][0]
+        if main_pid == 0:
+            raise RuntimeError("[frida] WeChatAppEx.exe main process not found")
+
+        main_proc = next((p for p in processes if p.pid == main_pid), None)
+        if main_proc is None:
+            raise RuntimeError("[frida] could not locate main WMPF process")
+
+        proc_path = main_proc.parameters.get("path", "")
+        wmpf_version = self._detect_wmpf_version(proc_path)
+        if wmpf_version is None:
+            raise RuntimeError(
+                f"[frida] cannot detect WMPF version from path: {proc_path}"
+            )
+
+        return [main_pid], wmpf_version
+
+    def _detect_wmpf_version(self, proc_path: str):
+        """Detect WMPF runtime version from a WeChatAppEx path.
+
+        新版微信路径形如 ...\\RadiumWMPF\\WeChatAppEx.exe（版本目录在
+        RadiumWMPF/{version}\\extracted\\runtime\\ 下），路径中最后一个数字
+        可能是用户名（如 C:\\Users\\<用户名>），不能直接取用。
+        """
+        path_norm = proc_path.replace("/", "\\")
+        m = re.search(r"RadiumWMPF(?:\\(\d+))?\\", path_norm, re.IGNORECASE)
+        if m and m.group(1):
+            version = int(m.group(1))
+            if version > 0:
+                return version
+        # 回退：从 RadiumWMPF 同级的版本目录中找与安装匹配的运行时
+        m_root = re.search(r"^(.*RadiumWMPF)\\", path_norm, re.IGNORECASE)
+        if m_root:
+            wmpf_root = Path(m_root.group(1))
+            if wmpf_root.is_dir():
+                cands = []
+                for child in wmpf_root.iterdir():
+                    if child.name.isdigit() and (child / "extracted" / "runtime" / "flue.dll").is_file():
+                        cands.append(int(child.name))
+                if cands:
+                    return max(cands)
+        return None
+
+    def _find_wmpf_pids_darwin(self):
+        """macOS: find WeChatAppEx PIDs via pgrep, version via Info.plist."""
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", "/MacOS/WeChatAppEx.app/Contents/MacOS/WeChatAppEx"],
+                text=True,
+            ).strip()
+            pids = [int(p) for p in out.splitlines() if p.strip()]
+        except (subprocess.CalledProcessError, ValueError):
+            pids = []
+        if not pids:
+            raise RuntimeError("[frida] WeChatAppEx process not found on macOS")
+
+        try:
+            ver_out = subprocess.check_output(
+                ["defaults", "read",
+                 "/Applications/WeChat.app/Contents/MacOS/WeChatAppEx.app/Contents/Info.plist",
+                 "CFBundleVersion"],
+                text=True,
+            ).strip()
+            version = int(ver_out.split(".")[1])
+        except Exception:
+            raise RuntimeError("[frida] cannot detect WeChatAppEx version from Info.plist")
+
+        return pids, version
+
+    def _start_frida_sync(self):
+        """frida 注入全流程（同步阻塞版，由 asyncio.to_thread 调起）。"""
+        logger = self.logger
+        is_mac = sys.platform == "darwin"
+        platform_dir = "mac" if is_mac else "win"
+
+        # Find PIDs and version
+        if is_mac:
+            pids, wmpf_version = self._find_wmpf_pids_darwin()
+        else:
+            pids, wmpf_version = self._find_wmpf_pids_win()
+
+        # Load hook script and config
+        project_root = self._get_project_root()
+        hook_path = project_root / "frida" / "hook.js"
+        if not hook_path.exists():
+            raise RuntimeError("[frida] hook script not found")
+
+        config_path = project_root / "frida" / "config" / platform_dir / f"addresses.{wmpf_version}.json"
+        # 状态卡上报：运行时版本 + 本地偏移配置是否就绪
+        self._notify_status("wmpf_version", wmpf_version)
+        self._notify_status("offset_ready", config_path.exists())
+        if not config_path.exists():
+            raise RuntimeError(
+                f"[frida] WMPF {wmpf_version} 本地无偏移配置（{config_path.name}），暂不支持该版本。"
+                f"请手动添加配置文件（参考 https://github.com/evi0s/WMPFDebugger/tree/main/frida/config/win32 ）。"
+            )
+
+        script_content = hook_path.read_text(encoding="utf-8")
+        config_content = json.dumps(json.loads(config_path.read_text(encoding="utf-8")))
+        final_script = script_content.replace("@@CONFIG@@", config_content)
+
+        # Inject into all target PIDs
+        device = frida.get_local_device()
+        session = None
+        script = None
+
+        def on_message(message, data):
+            if message.get("type") == "error":
+                logger.error("[frida client]", message)
+                return
+            logger.frida_debug("[frida client]", message.get("payload", ""))
+
+        for pid in pids:
+            try:
+                s = device.attach(pid)
+                sc = s.create_script(final_script)
+                sc.on("message", on_message)
+
+                # 会话随进程退出被杀时自动清理状态，
+                # 使 /engine/start 能感知并重新注入
+                def _on_detached(reason, *_a, _pid=pid):
+                    logger.error(f"[frida] session detached pid={_pid}: {reason}")
+                    if self.frida_session:
+                        self.frida_session = None
+                    if self.frida_script:
+                        self.frida_script = None
+                    self._notify_status("frida", False)
+                    self._notify_status("miniapp", False)
+
+                s.on("detached", _on_detached)
+                sc.load()
+                logger.info(f"[frida] injected pid={pid}, version={wmpf_version}")
+                # Keep first successful session/script as primary
+                if session is None:
+                    session, script = s, sc
+            except Exception as e:
+                logger.error(f"[frida] failed to inject pid={pid}: {e}")
+
+        if session is None:
+            raise RuntimeError("[frida] failed to inject any WeChatAppEx process")
+
+        logger.info(f"[frida] ready ({platform_dir}), version={wmpf_version}, {len(pids)} process(es)")
+        logger.info("[frida] you can now open any miniapps")
+        return session, script

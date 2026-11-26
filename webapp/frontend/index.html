@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minihunt — 小程序 AI 自动化渗透</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- 侧边栏 -->
+  <aside id="sidebar">
+    <div class="logo">
+      <img class="logo-icon" src="/static/favicon.ico" alt="Minihunt">
+      <span class="logo-text">Mini<span class="accent">hunt</span></span>
+    </div>
+    <nav id="nav"></nav>
+    <div class="sidebar-footer">
+      <div class="version-text">Minihunt v1.0.0</div>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <main id="main">
+    <header id="topbar">
+      <h1 id="page-title">前期预构</h1>
+      <div class="topbar-actions">
+        <button class="btn" id="btn-topbar-proxy">启动代理</button>
+        <button class="btn btn-primary" id="btn-engine">启动调试</button>
+      </div>
+    </header>
+    <div id="page-container"></div>
+  </main>
+</div>
+
+<!-- Toast -->
+<div id="toast-wrap"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

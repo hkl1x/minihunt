@@ -1,0 +1,31 @@
+.venv/
+.deps_installed
+__pycache__/
+*.py[cod]
+
+# ── 运行时数据（含测试会话与密钥，绝不入库）──
+sessions.json
+session_notes.json
+task_plans.json
+task_checkpoints.json
+reports_store.json
+boards_archive.json
+webapp_config.json
+webapp_models.json
+artifacts/
+reports/
+decompiled/
+
+# ── 日志与临时文件 ──
+_boot_log.txt
+_server_log.txt
+server_restart.log
+mitmdump_child.log
+*.log
+.tmp_report.json
+
+# ── 系统外大文件 ──
+19977/
+*.zip
+
+*.lnk
