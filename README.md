@@ -74,5 +74,4 @@ pip install -r requirements.txt
 
 进入「模型列表」页接入ai模型（支持Openai/Anthropic/Ollama）。
 
-### 6.开始对话测试
 
