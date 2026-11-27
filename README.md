@@ -45,7 +45,7 @@ Minihunt 是一个面向授权安全测试场景的微信小程序渗透测试�
 
 ### 1. 安装依赖
 
-需要 Python 3.10+：
+需要 Python 3.10+
 
 ```bash
 pip install -r requirements.txt
@@ -53,7 +53,7 @@ pip install -r requirements.txt
 
 ### 2. 配置微信路径
 
-编辑根目录 `minihunt_config.json`，填入微信 PC 版主程序完整路径,`packages_dir`微信小程序包路径 ：
+编辑根目录 `minihunt_config.json`，填入微信 PC 版主程序完整路径,`packages_dir`微信小程序包路径 
 
 ```json
 {
@@ -66,7 +66,7 @@ pip install -r requirements.txt
 
 ### 3. 启动
 
-双击 `启动Minihunt.bat`（需管理员权限）：自动拉起服务并打开浏览器 `http://127.0.0.1:8800`。
+双击 `启动Minihunt.bat`（需管理员权限）
 
 ### 4. 安装抓包证书
 
