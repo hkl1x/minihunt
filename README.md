@@ -53,16 +53,14 @@ pip install -r requirements.txt
 
 ### 2. 配置微信路径
 
-编辑根目录 `minihunt_config.json`，填入微信 PC 版主程序完整路径,`packages_dir`微信小程序包路径 
+编辑根目录 `minihunt_config.json`，`wechat_exe`填入微信 PC 版主程序完整路径,`packages_dir`微信小程序包路径 
 
 ```json
 {
   "wechat_exe": "C:\\Program Files\\Tencent\\WeChat\\WeChat.exe",
-  "packages_dir": ""
+  "packages_dir": "C:\\Users\\用户名\\AppData\\Roaming\\Tencent\\xwechat\\radium\\users\\微信账号\\applet\\packages"
 }
 ```
-
-
 
 ### 3. 启动
 
@@ -70,10 +68,11 @@ pip install -r requirements.txt
 
 ### 4. 安装抓包证书
 
-首次开启抓包后，双击 `%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.cer` 安装到「受信任的根证书颁发机构」，重启微信生效。HTTPS 流量即可完整解密。
+双击 `%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.cer` 安装到「受信任的根证书颁发机构」，重启系统。
 
 ### 5. 配置 AI 模型
 
-进入「模型列表」页填入 API Key（默认提供 DeepSeek 兼容端点，可自定义 base_url 接入任意 OpenAI 兼容模型）。不配 Key 也可使用抓包、反编译等非 AI 功能。
+进入「模型列表」页接入ai模型（支持Openai/Anthropic/Ollama）。
 
+### 6.开始对话测试
 
