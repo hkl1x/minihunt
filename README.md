@@ -72,6 +72,6 @@ pip install -r requirements.txt
 
 ### 5. 配置 AI 模型
 
-进入「模型列表」页接入ai模型（支持Openai/Anthropic/Ollama）。
+进入「模型列表」接入ai模型（支持Openai/Anthropic/Ollama）。
 
 
