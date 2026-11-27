@@ -75,8 +75,6 @@ pip install -r requirements.txt
 进入「模型列表」接入ai模型（支持Openai/Anthropic/Ollama）。
 
 
-首次开启抓包后，双击 `%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.cer` 安装到「受信任的根证书颁发机构」，重启微信生效。HTTPS 流量即可完整解密。
-
 ### 6. 微信版本更新适配
 
 微信小程序框架（WMPF）会随微信版本不断更新，导致引擎偏移配置失效。系统内置多版本偏移配置自动匹配；若你的微信版本过新无现成配置，使用 `wmpf-offset-extraction/` 提供的提取脚本与逆向方法论，即可自动分析新版框架生成新配置。
