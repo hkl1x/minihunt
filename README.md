@@ -88,10 +88,7 @@ python extract_offsets.py <flue.dll路径> <版本号>
 
 ## 致谢
 
-<!-- TODO: 致谢列表 -->
-- [frida](https://github.com/frida/frida) — 
-- [mitmproxy](https://github.com/mitmproxy/mitmproxy) — 
-- [FastAPI](https://github.com/fastapi/fastapi) — 
+
 
 ## 联系我
 
