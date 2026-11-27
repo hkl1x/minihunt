@@ -80,7 +80,6 @@ pip install -r requirements.txt
 微信小程序框架（WMPF）会随微信版本不断更新，导致引擎偏移配置失效。系统内置多版本偏移配置自动匹配；若你的微信版本过新无现成配置，使用 `wmpf-offset-extraction/` 提供的提取脚本与逆向方法论，即可自动分析新版框架生成新配置：
 
 ```bash
-cd wmpf-offset-extraction/scripts
 
 python extract_offsets.py <flue.dll路径> <版本号>
 
