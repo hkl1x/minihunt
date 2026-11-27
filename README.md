@@ -40,3 +40,44 @@ Minihunt 是一个面向授权安全测试场景的微信小程序渗透测试�
 |---|---|
 | ![画板](docs/img/board.png) | ![报告列表](docs/img/report_list.png) |
 | ![测试详情](docs/img/board_detail.png) | ![渗透报告](docs/img/report.png) |
+
+## 快速开始
+
+### 1. 安装依赖
+
+需要 Python 3.10+（安装时勾选 **Add to PATH**）：
+
+```bash
+pip install -r requirements.txt
+```
+
+网络不稳可用镜像：
+
+```bash
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 2. 配置微信路径
+
+编辑根目录 `minihunt_config.json`，填入微信 PC 版主程序完整路径：
+
+```json
+{
+  "wechat_exe": "C:\\Program Files\\Tencent\\WeChat\\WeChat.exe",
+  "packages_dir": ""
+}
+```
+
+`packages_dir` 留空即可，系统会自动扫描小程序包目录。
+
+### 3. 启动
+
+双击 `启动Minihunt.bat`（需管理员权限）：自动拉起服务并打开浏览器 `http://127.0.0.1:8800`。
+
+### 4. 配置 AI 模型
+
+进入「模型列表」页填入 API Key（默认提供 DeepSeek 兼容端点，可自定义 base_url 接入任意 OpenAI 兼容模型）。不配 Key 也可使用抓包、反编译等非 AI 功能。
+
+### 5. 安装抓包证书
+
+首次开启抓包后，双击 `%USERPROFILE%\.mitmproxy\mitmproxy-ca-cert.cer` 安装到「受信任的根证书颁发机构」，重启微信生效。HTTPS 流量即可完整解密。
