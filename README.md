@@ -53,7 +53,7 @@ pip install -r requirements.txt
 
 ### 2. 配置微信路径
 
-编辑根目录 `minihunt_config.json`，`wechat_exe`填入微信 PC 版主程序完整路径,`packages_dir`微信小程序包路径 
+编辑根目录 `minihunt_config.json`，`wechat_exe`填入微信 PC 版主程序完整路径,`packages_dir`填入微信小程序包路径 
 
 ```json
 {
