@@ -88,9 +88,9 @@ python extract_offsets.py <flue.dll路径> <版本号>
 
 ## 致谢
 
-- [WMPFDebugger](https://github.com/evi0s/WMPFDebugger) — 
-- [WMP-pentest-automation](https://github.com/hello-xiaoniao/WMP-pentest-automation) — 
-- [First](https://github.com/Spade-sec/First) — 
+- [WMPFDebugger](https://github.com/evi0s/WMPFDebugger) 
+- [WMP-pentest-automation](https://github.com/hello-xiaoniao/WMP-pentest-automation) 
+- [First](https://github.com/Spade-sec/First) 
 
 ## 联系我
 
