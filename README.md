@@ -43,6 +43,12 @@ Minihunt 是一个面向授权安全测试场景的微信小程序渗透测试�
 
 ![画板](docs/img/board.png)
 
+![测试详情](docs/img/board_detail.png)
+
 ### Skill页
 
 ![Skill 列表](docs/img/skills.png)
+
+### 报告页
+
+![渗透报告](docs/img/report.png)
