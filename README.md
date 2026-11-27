@@ -95,7 +95,5 @@ python extract_offsets.py <flue.dll路径> <版本号>
 
 ## 联系我
 
-<!-- TODO: 联系方式，按需增删 -->
-- 微信：`<填写微信号>`
-- 邮箱：`<填写邮箱>`
-- 交流群 / 公众号 / 博客：`<可选>`
+- 微信：`hkl1x666`
+- 博客：`https://www.freebuf.com/author/hkl1x?type=article`
