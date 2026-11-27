@@ -81,6 +81,8 @@ pip install -r requirements.txt
 
 ```bash
 cd wmpf-offset-extraction/scripts
+
 python extract_offsets.py <flue.dll路径> <版本号>
+
 # 例：python extract_offsets.py C:\WeChat\flue.dll 26513
 ```
