@@ -85,3 +85,17 @@ python extract_offsets.py <flue.dll路径> <版本号>
 
 # 例：python extract_offsets.py C:\WeChat\flue.dll 26513
 ```
+
+## 致谢
+
+<!-- TODO: 致谢列表 -->
+- [frida](https://github.com/frida/frida) — 
+- [mitmproxy](https://github.com/mitmproxy/mitmproxy) — 
+- [FastAPI](https://github.com/fastapi/fastapi) — 
+
+## 联系我
+
+<!-- TODO: 联系方式，按需增删 -->
+- 微信：`<填写微信号>`
+- 邮箱：`<填写邮箱>`
+- 交流群 / 公众号 / 博客：`<可选>`
